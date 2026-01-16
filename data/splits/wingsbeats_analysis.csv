@@ -1,0 +1,9 @@
+Species,Recordings,Files,Size (MB),File Types,% of Total
+Aedes aegypti,862.0,85553.0,819.49,.wav,30.6
+Aedes albopictus,203.0,20231.0,193.79,.wav,7.24
+Anopheles arabiensis,194.0,19297.0,184.84,.wav,6.9
+Anopheles gambiae,495.0,49471.0,473.87,.wav,17.7
+Culex pipiens,305.0,30415.0,291.34,.wav,10.88
+Culex quinquefasciatus,746.0,74599.0,714.56,.wav,26.68
+TOTAL,2805.0,279566.0,2677.89,N/A,100.0
+AVERAGE,467.5,46594.3,446.31,N/A,16.67
