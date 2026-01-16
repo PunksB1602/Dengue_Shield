@@ -1,0 +1,69 @@
+# Python / Environments
+__pycache__/
+*.pyc
+.venv/
+venv/
+.env
+.ipynb_checkpoints/
+.pytest_cache/
+
+# Data - ignore heavy stuff, keep structure
+data/raw/**
+data/processed/**
+data/interim/**
+data/external/**
+
+# But track splits and manifests
+!data/splits/
+!data/splits/**
+!data/**/manifest*.csv
+!data/**/manifest*.json
+!**/.gitkeep
+
+# Models & Artifacts
+saved_models/
+runs/
+logs/
+*.pth
+*.pt
+*.onnx
+
+# Archives
+*.zip
+*.rar
+*.7z
+*.tar
+*.tar.gz
+*.tgz
+
+# Audio files (only under data/)
+data/**/*.wav
+data/**/*.flac
+data/**/*.mp3
+data/**/*.m4a
+data/**/*.aac
+data/**/*.ogg
+
+# Allow demo audio in assets
+!assets/
+!assets/**
+!assets/**/*.wav
+!assets/**/*.mp3
+!assets/**/*.flac
+!assets/**/*.m4a
+!assets/**/*.aac
+!assets/**/*.ogg
+!app/assets/
+!app/assets/**
+!app/assets/**/*.wav
+!app/assets/**/*.mp3
+!app/assets/**/*.flac
+!app/assets/**/*.m4a
+!app/assets/**/*.aac
+!app/assets/**/*.ogg
+
+# OS / Editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

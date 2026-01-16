@@ -1,0 +1,15 @@
+torch
+torchvision
+torchaudio
+librosa>=0.10,<0.11
+numpy>=1.23,<2.0
+pandas
+scikit-learn
+scipy
+soundfile
+sounddevice>=0.4,<0.5
+streamlit>=1.28,<2.0
+tqdm
+pyyaml
+matplotlib
+protobuf<5
