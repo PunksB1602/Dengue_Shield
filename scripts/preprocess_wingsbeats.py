@@ -9,6 +9,7 @@ from pathlib import Path
 from collections import defaultdict
 import warnings
 import csv
+import hashlib
 import numpy as np
 import soundfile as sf
 from tqdm import tqdm
@@ -31,7 +32,8 @@ CLASS_MAPPING = {
 }
 
 # Configuration
-PEAK_THRESHOLD = 0.01  # Skip clips with peak below this (more reliable for tiny bursts)
+PEAK_THRESHOLD = 0.005  # Skip clips with peak below this (relaxed since RMS is primary gate)
+CLIP_RMS_THRESHOLD = 0.001  # Skip clips with RMS below this (steadier than peak alone)
 MIN_CLIP_SAMPLES = 200  # Minimum clip length (~12.5ms at 16kHz) to avoid unstable RMS
 FADE_MS = 3  # Fade duration in ms (prevents click artifacts)
 FADE_SAMPLES = int(TARGET_SR * FADE_MS / 1000)
@@ -113,7 +115,7 @@ def collect_wav_files(recording_folder):
     return sorted([f for f in recording_folder.rglob('*.wav') if f.is_file()])
 
 
-def process_recording_folder(recording_folder, species_name, class_name, output_dir, stats):
+def process_recording_folder(recording_folder, species_name, class_name, output_dir, input_base, stats):
     """
     Process one recording folder: merge micro-clips into 1-second windows.
     
@@ -122,6 +124,7 @@ def process_recording_folder(recording_folder, species_name, class_name, output_
         species_name: Original species name
         class_name: Output class name (Aedes/Anopheles/Culex)
         output_dir: Output directory for this class
+        input_base: Base input directory (for relative path computation)
         stats: Dictionary to accumulate statistics
     
     Returns:
@@ -131,7 +134,17 @@ def process_recording_folder(recording_folder, species_name, class_name, output_
     wav_files = collect_wav_files(recording_folder)
     
     if len(wav_files) == 0:
-        return 0, 0, 0, False
+        return 0, 0, 0, 0, False
+    
+    # CRITICAL: Shuffle micro-clips to avoid filesystem-order bias
+    # This prevents the model from learning transition artifacts
+    # Use stable MD5-based seed from relative path for reproducibility (portable across machines)
+    seed_key = str(recording_folder.relative_to(input_base)).replace('\\', '/')
+    folder_seed = int(hashlib.md5(seed_key.encode('utf-8')).hexdigest()[:8], 16)
+    rng = np.random.RandomState(folder_seed)
+    wav_files = [wav_files[i] for i in rng.permutation(len(wav_files))]
+    
+    # Store seed_key for manifest origin (prevents collision if two species have same folder name)
     
     # Use list to accumulate clips for better performance
     clip_list = []
@@ -142,16 +155,30 @@ def process_recording_folder(recording_folder, species_name, class_name, output_
     window_count = 0
     clips_processed_local = 0
     clips_skipped_local = 0
+    total_clips_seen = 0
     error_count = 0
     
     for wav_file in wav_files:
         if window_count >= MAX_WINDOWS_PER_RECORDING:
             break
         
+        total_clips_seen += 1
+        
         try:
             audio, sr = load_audio_smart(wav_file, target_sr=TARGET_SR)
             
+            # Guard against empty clips
+            if len(audio) == 0:
+                clips_skipped_local += 1
+                continue
+            
             if len(audio) < MIN_CLIP_SAMPLES:
+                clips_skipped_local += 1
+                continue
+            
+            # Clip-level RMS gate (steadier than peak alone)
+            clip_rms = np.sqrt(np.mean(audio ** 2))
+            if clip_rms < CLIP_RMS_THRESHOLD:
                 clips_skipped_local += 1
                 continue
             
@@ -201,7 +228,8 @@ def process_recording_folder(recording_folder, species_name, class_name, output_
                         'label': class_name,
                         'source': 'Wingsbeats',
                         'species': species_name,
-                        'origin': recording_name,
+                        'recording': recording_name,
+                        'origin': seed_key,
                         'rms': f"{win_rms:.6f}"
                     })
                     
@@ -244,7 +272,8 @@ def process_recording_folder(recording_folder, species_name, class_name, output_
             'label': class_name,
             'source': 'Wingsbeats',
             'species': species_name,
-            'origin': recording_name,
+            'recording': recording_name,
+            'origin': seed_key,
             'rms': f"{win_rms:.6f}"
         })
         
@@ -271,7 +300,8 @@ def process_recording_folder(recording_folder, species_name, class_name, output_
                     'label': class_name,
                     'source': 'Wingsbeats',
                     'species': species_name,
-                    'origin': recording_name,
+                    'recording': recording_name,
+                    'origin': seed_key,
                     'rms': f"{win_rms:.6f}"
                 })
                 
@@ -279,7 +309,7 @@ def process_recording_folder(recording_folder, species_name, class_name, output_
     
     recording_used = window_count > 0
     
-    return window_count, clips_processed_local, clips_skipped_local, recording_used
+    return window_count, clips_processed_local, clips_skipped_local, total_clips_seen, recording_used
 
 
 def preprocess_wingsbeats():
@@ -291,6 +321,11 @@ def preprocess_wingsbeats():
         print(f"ERROR: Input directory not found: {input_base}")
         return
     
+    # Clear existing output files to avoid duplicates on reruns
+    if output_base.exists():
+        for wav_file in output_base.rglob('*.wav'):
+            wav_file.unlink()
+    
     print("="*80)
     print(" "*25 + "WINGSBEATS PREPROCESSING")
     print("="*80)
@@ -300,6 +335,7 @@ def preprocess_wingsbeats():
     print(f"  Target sample rate:     {TARGET_SR} Hz")
     print(f"  Target duration:        {TARGET_DURATION} s ({TARGET_SAMPLES} samples)")
     print(f"  Peak threshold:         {PEAK_THRESHOLD} (skip clips below this)")
+    print(f"  Clip RMS threshold:     {CLIP_RMS_THRESHOLD} (skip clips below this)")
     print(f"  Min clip length:        {MIN_CLIP_SAMPLES} samples (~{MIN_CLIP_SAMPLES/TARGET_SR*1000:.1f} ms)")
     print(f"  Fade duration:          {FADE_MS} ms (prevents clicks)")
     print(f"  Normalize clips:        {NORMALIZE_CLIPS}")
@@ -314,8 +350,9 @@ def preprocess_wingsbeats():
         'recordings_processed': defaultdict(int),
         'clips_skipped': 0,
         'clips_processed': 0,
+        'total_clips_seen': 0,
         'errors': [],
-        'manifest': []  # CSV records
+        'manifest': []  # CSV records - CRITICAL: Split by 'origin' (recording folder), not by window!
     }
     
     species_dirs = sorted([d for d in input_base.iterdir() if d.is_dir()])
@@ -348,20 +385,23 @@ def preprocess_wingsbeats():
         species_windows = 0
         species_clips_processed = 0
         species_clips_skipped = 0
+        species_clips_seen = 0
         species_recordings_used = 0
         
 
         for recording_folder in tqdm(recording_folders, desc=f"  {species_name}", ncols=100):
-            windows, clips_proc, clips_skip, recording_used = process_recording_folder(
+            windows, clips_proc, clips_skip, clips_seen, recording_used = process_recording_folder(
                 recording_folder=recording_folder,
                 species_name=species_name,
                 class_name=class_name,
                 output_dir=output_dir,
+                input_base=input_base,
                 stats=stats
             )
             species_windows += windows
             species_clips_processed += clips_proc
             species_clips_skipped += clips_skip
+            species_clips_seen += clips_seen
             if recording_used:
                 species_recordings_used += 1
         
@@ -369,9 +409,16 @@ def preprocess_wingsbeats():
         stats['recordings_processed'][class_name] += species_recordings_used
         stats['clips_processed'] += species_clips_processed
         stats['clips_skipped'] += species_clips_skipped
+        stats['total_clips_seen'] += species_clips_seen
+        
+        # Calculate acceptance ratio
+        # Note: This reflects acceptance up to MAX_WINDOWS_PER_RECORDING cap
+        # Later clips in folders that hit the cap aren't evaluated
+        acceptance_rate = (species_clips_processed / species_clips_seen * 100) if species_clips_seen > 0 else 0
         
         print(f"  Created {species_windows} windows from {species_recordings_used}/{len(recording_folders)} recordings" +
-              f" ({species_clips_processed} clips processed, {species_clips_skipped} skipped)\n")
+              f" ({species_clips_processed} clips processed, {species_clips_skipped} skipped)")
+        print(f"  Clip acceptance rate: {acceptance_rate:.1f}% ({species_clips_processed}/{species_clips_seen})\n")
     
     print("\n" + "="*80)
     print(" "*30 + "SUMMARY STATISTICS")
@@ -412,7 +459,7 @@ def preprocess_wingsbeats():
     
     if stats['manifest']:
         with open(manifest_path, 'w', newline='', encoding='utf-8') as f:
-            fieldnames = ['path', 'label', 'source', 'species', 'origin', 'rms']
+            fieldnames = ['path', 'label', 'source', 'species', 'recording', 'origin', 'rms']
             writer = csv.DictWriter(f, fieldnames=fieldnames)
             writer.writeheader()
             writer.writerows(stats['manifest'])

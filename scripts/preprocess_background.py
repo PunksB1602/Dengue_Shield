@@ -20,7 +20,7 @@ TARGET_SR = 16000
 WINDOW_SEC = 1.0
 TARGET_SAMPLES = int(TARGET_SR * WINDOW_SEC)
 
-HOP_SEC = 1.0
+HOP_SEC = 0.5  # Smaller hop for better candidate scanning (still subsample overall)
 RMS_THRESHOLD = 0.001
 MAX_CANDIDATES_PER_FILE = 500  # Sample positions for long files
 TOPK_ENERGY = 5
@@ -38,9 +38,15 @@ def compute_rms(audio):
 
 
 def mosquito_score(window, sr=TARGET_SR):
-    """Compute mosquito-band score: ratio of energy in 250-900 Hz band to total 0-4kHz."""
+    """Compute mosquito-band score: ratio and absolute energy.
+    
+    Uses same band as ABUZZ (250-1200 Hz) for consistency.
+    
+    Returns:
+        tuple: (ratio, band_energy)
+    """
     FMAX = 4000
-    BAND_LO, BAND_HI = 250, 900
+    BAND_LO, BAND_HI = 250, 1200
     x = window.astype(np.float32)
     x = x - np.mean(x)
     spec = np.abs(np.fft.rfft(x))**2
@@ -49,9 +55,11 @@ def mosquito_score(window, sr=TARGET_SR):
     mask_all = (freqs >= 0) & (freqs <= FMAX)
     mask_band = (freqs >= BAND_LO) & (freqs <= BAND_HI)
     
-    denom = spec[mask_all].sum() + 1e-12
-    numer = spec[mask_band].sum()
-    return float(numer / denom)
+    band_energy = spec[mask_band].sum()
+    all_energy = spec[mask_all].sum()
+    ratio = float(band_energy / (all_energy + 1e-12))
+    
+    return ratio, band_energy
 
 
 def load_audio_smart(filepath, target_sr=TARGET_SR):
@@ -121,21 +129,40 @@ def process_background_file(filepath, output_dir, input_base, stats, global_limi
     if num_possible <= 0:
         return 0
     
-    # Pick candidate indices
+    # Block-based sampling for better coverage across the entire recording
+    # Split file into blocks and sample from each block
     if num_possible > MAX_CANDIDATES_PER_FILE:
-        cand_idxs = sorted(np.random.choice(num_possible, MAX_CANDIDATES_PER_FILE, replace=False))
+        num_blocks = min(20, num_possible // 10)  # 10-20 blocks
+        block_size = num_possible // num_blocks
+        samples_per_block = max(1, MAX_CANDIDATES_PER_FILE // num_blocks)
+        
+        cand_idxs = []
+        for block_idx in range(num_blocks):
+            block_start = block_idx * block_size
+            block_end = min((block_idx + 1) * block_size, num_possible)
+            if block_end > block_start:
+                block_samples = min(samples_per_block, block_end - block_start)
+                block_choices = np.random.choice(
+                    range(block_start, block_end), 
+                    block_samples, 
+                    replace=False
+                )
+                cand_idxs.extend(block_choices)
+        cand_idxs = sorted(cand_idxs)
     else:
         cand_idxs = list(range(num_possible))
     
     candidates = []
     clipping_warnings = 0
     
-    # Generate unique prefix from relative path
+    # Generate unique prefix from relative path for filenames
     try:
-        rel_path = filepath.relative_to(input_base)
-        file_prefix = str(rel_path.with_suffix('')).replace('\\', '_').replace('/', '_').replace(' ', '_')
+        rel_file_path = filepath.relative_to(input_base)
+        file_prefix = str(rel_file_path.with_suffix('')).replace('\\', '_').replace('/', '_').replace(' ', '_')
+        origin_key = str(rel_file_path.with_suffix('')).replace('\\', '/')  # Collision-proof for manifest
     except ValueError:
         file_prefix = filepath.stem.replace(' ', '_')
+        origin_key = filepath.stem
     
     for j, widx in enumerate(cand_idxs):
         start_sample = widx * hop_samples
@@ -148,8 +175,15 @@ def process_background_file(filepath, output_dir, input_base, stats, global_limi
         if rms < RMS_THRESHOLD:
             continue
         
-        # Reject mosquito-like background (fans, motors)
-        if mosquito_score(window) > 0.12:
+        # Skip near-silent windows by peak amplitude
+        if np.max(np.abs(window)) < 0.005:
+            continue
+        
+        # Reject mosquito-like background (fans, motors) using dual check
+        # Requires BOTH high ratio AND high absolute energy to reject
+        # This prevents rejecting quiet tonal background unnecessarily
+        m_ratio, m_band_energy = mosquito_score(window)
+        if m_ratio > 0.12 and m_band_energy > 1e-5:
             continue
         
         peak = np.abs(window).max()
@@ -174,12 +208,27 @@ def process_background_file(filepath, output_dir, input_base, stats, global_limi
     if global_limit_remaining is not None:
         max_to_save = min(max_to_save, global_limit_remaining)
     
-    topk = min(TOPK_ENERGY, len(candidates), max_to_save)
-    selected_topk = candidates[:topk]
-    remaining_candidates = candidates[topk:]
+    # Select top-K with diversity guard (minimum distance between selections)
+    MIN_DISTANCE = 5  # Minimum windows apart to ensure variety
+    selected_topk = []
+    for candidate in candidates:
+        if len(selected_topk) >= min(TOPK_ENERGY, max_to_save):
+            break
+        # Check distance from already selected
+        widx = candidate[2]
+        if all(abs(widx - s[2]) >= MIN_DISTANCE for s in selected_topk):
+            selected_topk.append(candidate)
     
-    remaining_slots = max_to_save - topk
-    if len(remaining_candidates) > 0 and remaining_slots > 0:
+    # If we didn't get enough due to distance constraint, fill remaining slots
+    if len(selected_topk) < min(TOPK_ENERGY, len(candidates), max_to_save):
+        for candidate in candidates:
+            if candidate not in selected_topk and len(selected_topk) < min(TOPK_ENERGY, max_to_save):
+                selected_topk.append(candidate)
+    
+    remaining_candidates = [c for c in candidates if c not in selected_topk]
+    
+    remaining_slots = max_to_save - len(selected_topk)
+    if remaining_candidates and remaining_slots > 0:
         randomk = min(RANDOMK, len(remaining_candidates), remaining_slots)
         selected_random = random.sample(remaining_candidates, randomk)
     else:
@@ -190,6 +239,12 @@ def process_background_file(filepath, output_dir, input_base, stats, global_limi
     
     windows_saved = 0
     for window, rms, widx in selected:
+        # Apply normalization if enabled
+        if NORMALIZE_WINDOWS:
+            peak = np.abs(window).max()
+            if peak > 1e-6:
+                window = window * (0.95 / peak)
+        
         output_filename = f"Background__{file_prefix}__idx{widx:06d}.wav"
         output_path = output_dir / output_filename
         sf.write(output_path, window, TARGET_SR, subtype='PCM_16')
@@ -201,7 +256,7 @@ def process_background_file(filepath, output_dir, input_base, stats, global_limi
             'label': 'Background',
             'source': 'Background',
             'species': 'Background',
-            'origin': file_prefix,
+            'origin': origin_key,  # Collision-proof relative path
             'rms': f"{rms:.6f}"
         })
         
@@ -233,7 +288,7 @@ def preprocess_background():
     print(f"\nConfiguration:")
     print(f"  Target sample rate:     {TARGET_SR} Hz")
     print(f"  Window duration:        {WINDOW_SEC} s ({TARGET_SAMPLES} samples)")
-    print(f"  Hop duration:           {HOP_SEC} s (non-overlapping)")
+    print(f"  Hop duration:           {HOP_SEC} s (for candidate scanning)")
     print(f"  RMS threshold:          {RMS_THRESHOLD} (permissive silence gate)")
     print(f"  Top-K by energy:        {TOPK_ENERGY} (captures events)")
     print(f"  Random-K from rest:     {RANDOMK} (captures ambience)")
@@ -246,8 +301,8 @@ def preprocess_background():
     
     output_base.mkdir(parents=True, exist_ok=True)
     
-    # Clear existing output files to avoid duplicates
-    for wav_file in output_base.glob('*.wav'):
+    # Clear existing output files to avoid duplicates (use rglob for safety)
+    for wav_file in output_base.rglob('*.wav'):
         wav_file.unlink()
     
     stats = {

@@ -30,9 +30,11 @@ CLASS_MAPPING = {
 }
 
 FMAX = 4000
-BAND_LO, BAND_HI = 250, 900  # Mosquito wingbeat frequency range
+BAND_LO, BAND_HI = 250, 1200  # Mosquito wingbeat frequency range (wider for harmonics)
+BAND_ENERGY_MIN = 1e-6  # Minimum absolute band energy (prevents high-ratio but quiet windows)
 HOP_SEC = 0.5
 RMS_THRESHOLD = 0.001
+MOSQUITO_SCORE_MIN = 0.02  # Minimum ratio threshold
 K_WINDOWS_PER_FILE = 5
 NORMALIZE_WINDOWS = False
 CLIP_THRESHOLD = 0.999
@@ -44,7 +46,11 @@ def compute_rms(audio):
 
 
 def mosquito_score(window, sr=TARGET_SR):
-    """Compute mosquito-band score: ratio of energy in 300-1200 Hz band to total 0-4kHz."""
+    """Compute mosquito-band score: ratio and absolute energy in mosquito band.
+    
+    Returns:
+        tuple: (ratio, band_energy) where ratio is band/total and band_energy is absolute
+    """
     x = window.astype(np.float32)
     x = x - np.mean(x)
     spec = np.abs(np.fft.rfft(x))**2
@@ -53,9 +59,11 @@ def mosquito_score(window, sr=TARGET_SR):
     mask_all = (freqs >= 0) & (freqs <= FMAX)
     mask_band = (freqs >= BAND_LO) & (freqs <= BAND_HI)
     
-    denom = spec[mask_all].sum() + 1e-12
-    numer = spec[mask_band].sum()
-    return float(numer / denom)
+    band_energy = spec[mask_band].sum()
+    all_energy = spec[mask_all].sum()
+    ratio = float(band_energy / (all_energy + 1e-12))
+    
+    return ratio, band_energy
 
 
 def normalize_window(audio, headroom=0.95):
@@ -93,7 +101,7 @@ def load_audio_smart(filepath, target_sr=TARGET_SR):
         raise RuntimeError(f"Failed to load {filepath}: {e}")
 
 
-def process_abuzz_file(filepath, class_name, species_name, output_dir, stats):
+def process_abuzz_file(filepath, class_name, species_name, output_dir, input_base, stats):
     """
     Process one ABUZZ file: extract windows, score them, and select top K.
     
@@ -102,6 +110,7 @@ def process_abuzz_file(filepath, class_name, species_name, output_dir, stats):
         class_name: Output class name (Aedes/Anopheles/Culex)
         species_name: Original species name
         output_dir: Output directory for this class
+        input_base: Base input directory (for collision-safe origin)
         stats: Dictionary to accumulate statistics
     
     Returns:
@@ -120,51 +129,82 @@ def process_abuzz_file(filepath, class_name, species_name, output_dir, stats):
     clipping_warnings = 0
     file_stem = filepath.stem.replace(' ', '_')
     
+    # Track filtering stats
+    total_windows = 0
+    passed_rms = 0
+    passed_score = 0
+    
     for idx, start_sample in enumerate(range(0, len(audio) - TARGET_SAMPLES + 1, hop_samples)):
         window = audio[start_sample : start_sample + TARGET_SAMPLES]
         
         if len(window) < TARGET_SAMPLES:
             continue
         
+        total_windows += 1
+        
         rms = compute_rms(window)
         if rms < RMS_THRESHOLD:
             continue
         
-        score = mosquito_score(window, sr=TARGET_SR)
+        passed_rms += 1
         
-        if score < 0.02:
+        ratio, band_energy = mosquito_score(window, sr=TARGET_SR)
+        
+        # CRITICAL: Require BOTH high ratio AND sufficient absolute energy
+        # This blocks "quiet but high-ratio" windows (e.g., faint hums)
+        if ratio < MOSQUITO_SCORE_MIN or band_energy < BAND_ENERGY_MIN:
             continue
+        
+        passed_score += 1
         
         peak = np.abs(window).max()
         if peak >= CLIP_THRESHOLD:
             clipping_warnings += 1
         
-        candidates.append((window, score, rms, idx))
+        candidates.append((window, ratio, band_energy, rms, idx))
     
     total_candidates = len(candidates)
     
+    # Track score distribution
+    if len(candidates) > 0:
+        scores = [c[1] for c in candidates]
+        stats['score_distribution'].extend(scores)
+    
     if len(candidates) > K_WINDOWS_PER_FILE:
-        candidates.sort(key=lambda x: x[1], reverse=True)
+        candidates.sort(key=lambda x: x[1], reverse=True)  # Sort by ratio score
         selected = candidates[:K_WINDOWS_PER_FILE]
         
         # Add loudest window as an extra diversity window (often noisy)
-        loudest = max(candidates, key=lambda x: x[2])
+        loudest = max(candidates, key=lambda x: x[3])  # By RMS
         if loudest not in selected:
             selected.append(loudest)
+        
+        # Add median-score window for harder positives (prevents overfitting to cleanest)
+        if len(candidates) >= 3:
+            by_score = sorted(candidates, key=lambda x: x[1])  # Sort by ratio ascending
+            median = by_score[len(by_score) // 2]
+            if median not in selected:
+                selected.append(median)
+        
+        # Note: Can save up to K+2 windows (K top + loudest + median if not already included)
+        # To enforce hard cap: selected = selected[:K_WINDOWS_PER_FILE]
         
         windows_rejected = len(candidates) - len(selected)
     else:
         selected = candidates
         windows_rejected = 0
     
-    selected.sort(key=lambda x: x[3])
+    selected.sort(key=lambda x: x[4])  # Sort by index for temporal order
+    
+    # Create collision-safe origin key from relative path
+    origin_key = str(filepath.relative_to(input_base)).replace('\\', '/')
     
     windows_saved = 0
-    for window, score, rms, idx in selected:
+    for window, ratio, band_energy, rms, idx in selected:
         if NORMALIZE_WINDOWS:
             window = normalize_window(window)
         
-        output_filename = f"{species_name.replace(' ', '_')}__{file_stem}__seg{windows_saved:04d}.wav"
+        output_filename = f"{species_name.replace(' ', '_')}__{file_stem}__idx{idx:06d}.wav"
         output_path = output_dir / output_filename
         sf.write(output_path, window, TARGET_SR, subtype='PCM_16')
         
@@ -175,8 +215,8 @@ def process_abuzz_file(filepath, class_name, species_name, output_dir, stats):
             'label': class_name,
             'source': 'Abuzz',
             'species': species_name,
-            'origin': filepath.stem,
-            'score': f"{score:.4f}",
+            'origin': origin_key,
+            'score': f"{ratio:.4f}",
             'rms': f"{rms:.6f}"
         })
         
@@ -184,6 +224,16 @@ def process_abuzz_file(filepath, class_name, species_name, output_dir, stats):
     
     if clipping_warnings > 0:
         stats['clipping_files'].append(f"{filepath.name}: {clipping_warnings} windows near clipping")
+    
+    # Store filtering stats
+    stats['file_stats'].append({
+        'file': filepath.name,
+        'total_windows': total_windows,
+        'passed_rms': passed_rms,
+        'passed_score': passed_score,
+        'candidates': total_candidates,
+        'saved': windows_saved
+    })
     
     return windows_saved, total_candidates, windows_rejected
 
@@ -199,8 +249,9 @@ def preprocess_abuzz():
     
     # Clear existing output files to avoid duplicates
     if output_base.exists():
-        for wav_file in output_base.rglob('*.wav'):
-            wav_file.unlink()
+        import shutil
+        shutil.rmtree(output_base)
+    output_base.mkdir(parents=True, exist_ok=True)
     
     print("="*80)
     print(" "*28 + "ABUZZ PREPROCESSING")
@@ -213,7 +264,9 @@ def preprocess_abuzz():
     print(f"  Hop duration:           {HOP_SEC} s (50% overlap)")
     print(f"  RMS threshold:          {RMS_THRESHOLD}")
     print(f"  Mosquito band:          {BAND_LO}-{BAND_HI} Hz (out of 0-{FMAX} Hz)")
-    print(f"  Top-K per file:         {K_WINDOWS_PER_FILE} (by mosquito score + 1 loudest)")
+    print(f"  Score ratio threshold:  {MOSQUITO_SCORE_MIN}")
+    print(f"  Band energy threshold:  {BAND_ENERGY_MIN}")
+    print(f"  Top-K per file:         {K_WINDOWS_PER_FILE} (+ up to 2 diversity: loudest + median)")
     print(f"  Normalize windows:      {NORMALIZE_WINDOWS}")
     print(f"  Clipping threshold:     {CLIP_THRESHOLD}")
     print("="*80 + "\n")
@@ -225,7 +278,9 @@ def preprocess_abuzz():
         'windows_rejected': 0,
         'errors': [],
         'clipping_files': [],
-        'manifest': []  # CSV records
+        'manifest': [],  # CSV records - CRITICAL: Split by 'origin' (file stem), not by window!
+        'score_distribution': [],
+        'file_stats': []
     }
     
     species_dirs = sorted([d for d in input_base.iterdir() if d.is_dir()])
@@ -266,6 +321,7 @@ def preprocess_abuzz():
                 class_name=class_name,
                 species_name=species_name,
                 output_dir=output_dir,
+                input_base=input_base,
                 stats=stats
             )
             species_windows += windows
@@ -328,6 +384,48 @@ def preprocess_abuzz():
                 print(f"  - {error}")
             print(f"  ... and {len(stats['errors']) - 5} more errors")
     
+    # CRITICAL: Filtering acceptance analysis
+    print("\n" + "="*80)
+    print(" "*25 + "FILTERING ACCEPTANCE ANALYSIS")
+    print("="*80)
+    
+    if stats['file_stats']:
+        total_windows_scanned = sum(f['total_windows'] for f in stats['file_stats'])
+        total_passed_rms = sum(f['passed_rms'] for f in stats['file_stats'])
+        total_passed_score = sum(f['passed_score'] for f in stats['file_stats'])
+        
+        rms_rate = (total_passed_rms / total_windows_scanned * 100) if total_windows_scanned > 0 else 0
+        score_rate = (total_passed_score / total_passed_rms * 100) if total_passed_rms > 0 else 0
+        overall_rate = (total_passed_score / total_windows_scanned * 100) if total_windows_scanned > 0 else 0
+        
+        print(f"\nWindows scanned:        {total_windows_scanned}")
+        print(f"Passed RMS filter:      {total_passed_rms} ({rms_rate:.1f}%)")
+        print(f"Passed score filter:    {total_passed_score} ({score_rate:.1f}% of RMS-passed)")
+        print(f"Overall acceptance:     {overall_rate:.1f}%")
+        
+        # Files with no candidates
+        zero_candidate_files = [f['file'] for f in stats['file_stats'] if f['candidates'] == 0]
+        if zero_candidate_files:
+            print(f"\nFiles with 0 candidates: {len(zero_candidate_files)}/{len(stats['file_stats'])}")
+            if len(zero_candidate_files) <= 5:
+                for fname in zero_candidate_files:
+                    print(f"  - {fname}")
+            else:
+                for fname in zero_candidate_files[:3]:
+                    print(f"  - {fname}")
+                print(f"  ... and {len(zero_candidate_files) - 3} more")
+            print("  → If many files have 0 candidates, thresholds may be too strict!")
+    
+    # Score distribution
+    if stats['score_distribution']:
+        scores = np.array(stats['score_distribution'])
+        print(f"\nScore distribution:")
+        print(f"  Min:     {scores.min():.4f}")
+        print(f"  Median:  {np.median(scores):.4f}")
+        print(f"  Mean:    {scores.mean():.4f}")
+        print(f"  Max:     {scores.max():.4f}")
+        print(f"  Std:     {scores.std():.4f}")
+    
     print("="*80)
     print("\nPreprocessing complete!")
     print(f"Output saved to: {output_base.absolute()}")
@@ -353,5 +451,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-

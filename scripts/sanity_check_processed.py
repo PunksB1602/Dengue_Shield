@@ -20,10 +20,11 @@ TARGET_DURATION = 1.0
 TARGET_SAMPLES = int(TARGET_SR * TARGET_DURATION)
 SAMPLES_PER_CLASS = 10
 
-# Mosquito-band parameters
+# Mosquito-band parameters (consistent with preprocess scripts)
 FMAX = 4000
-BAND_LO, BAND_HI = 300, 1200
-MOSQUITO_SCORE_THRESHOLD = 0.03  # Min mosquito-band energy ratio
+BAND_LO, BAND_HI = 250, 1200  # Match ABUZZ/Wingsbeats preprocess
+MOSQUITO_SCORE_THRESHOLD_MIN = 0.02  # Min for mosquito datasets
+MOSQUITO_SCORE_THRESHOLD_MAX = 0.12  # Max for background dataset
 
 
 def count_files_per_class(processed_dir):
@@ -39,7 +40,7 @@ def count_files_per_class(processed_dir):
 
 
 def mosquito_score(window, sr=TARGET_SR):
-    """Ratio of energy in 300-1200 Hz to total 0-4kHz."""
+    """Ratio of energy in 250-1200 Hz to total 0-4kHz."""
     x = window - np.mean(window)
     spec = np.abs(np.fft.rfft(x))**2
     freqs = np.fft.rfftfreq(len(x), d=1.0/sr)
@@ -48,8 +49,16 @@ def mosquito_score(window, sr=TARGET_SR):
     return float(spec[mask_band].sum() / (spec[mask_all].sum() + 1e-12))
 
 
-def check_file_duration_and_content(filepath, use_mosquito_check=True):
-    """Check if file has correct format and audible content."""
+def check_file_duration_and_content(filepath, check_mode='rms_only'):
+    """Check if file has correct format and audible content.
+    
+    Args:
+        filepath: Path to audio file
+        check_mode: 'mosquito_positive', 'mosquito_negative', or 'rms_only'
+    
+    Returns:
+        tuple: (format_ok, has_content, sr, num_samples, rms, peak, m_score)
+    """
     try:
         audio, sr = sf.read(filepath, dtype='float32')
         if audio.ndim == 2:
@@ -58,15 +67,21 @@ def check_file_duration_and_content(filepath, use_mosquito_check=True):
         samples_ok = (len(audio) == TARGET_SAMPLES)
         format_ok = sr_ok and samples_ok
         rms = np.sqrt(np.mean(audio ** 2))
-        if use_mosquito_check:
-            m_score = mosquito_score(audio, sr=sr)
-            has_content = (rms > 0.001) and (m_score > MOSQUITO_SCORE_THRESHOLD)
-        else:
-            has_content = rms > 0.001
         peak = np.abs(audio).max()
-        return format_ok, has_content, sr, len(audio), rms, peak
+        
+        m_score = None
+        if check_mode == 'mosquito_positive':
+            m_score = mosquito_score(audio, sr=sr)
+            has_content = (rms > 0.001) and (m_score > MOSQUITO_SCORE_THRESHOLD_MIN)
+        elif check_mode == 'mosquito_negative':
+            m_score = mosquito_score(audio, sr=sr)
+            has_content = (rms > 0.001) and (m_score < MOSQUITO_SCORE_THRESHOLD_MAX)
+        else:  # rms_only
+            has_content = rms > 0.001
+        
+        return format_ok, has_content, sr, len(audio), rms, peak, m_score
     except Exception:
-        return False, False, 0, 0, 0.0, 0.0
+        return False, False, 0, 0, 0.0, 0.0, None
 
 
 def play_audio_sample(filepath):
@@ -99,10 +114,33 @@ def play_audio_sample(filepath):
 def sanity_check():
     """Run comprehensive sanity checks on processed dataset."""
     DATASET = sys.argv[1] if len(sys.argv) > 1 else "Abuzz"
-    processed_dir = Path(f"data/processed/{DATASET}")
-    if DATASET == "Background":
+    
+    # Robust path resolver (case-insensitive)
+    candidates = [
+        Path(f"data/processed/{DATASET}"),
+        Path(f"data/processed/{DATASET.lower()}"),
+        Path(f"data/processed/{DATASET.capitalize()}"),
+    ]
+    
+    processed_dir = None
+    if DATASET.lower() == "background":
         processed_dir = Path("data/processed/Background/Background")
-    use_mosquito_check = (DATASET == "Abuzz")
+    else:
+        for p in candidates:
+            if p.exists():
+                processed_dir = p
+                break
+        if processed_dir is None:
+            processed_dir = candidates[0]  # fallback
+    
+    # Determine check mode based on dataset
+    if DATASET.lower() in ["abuzz", "wingsbeats"]:
+        check_mode = 'mosquito_positive'
+    elif DATASET.lower() == "background":
+        check_mode = 'mosquito_negative'
+    else:
+        check_mode = 'rms_only'
+    
     if not processed_dir.exists():
         print(f"ERROR: Processed directory not found: {processed_dir}")
         print(f"Please run preprocess_{DATASET.lower()}.py first.")
@@ -111,8 +149,10 @@ def sanity_check():
     print(" "*25 + f"SANITY CHECK - {DATASET.upper()}")
     print("="*80)
     print(f"Checking: {processed_dir.absolute()}")
-    if use_mosquito_check:
-        print(f"Using mosquito-band content check (threshold: {MOSQUITO_SCORE_THRESHOLD})\n")
+    if check_mode == 'mosquito_positive':
+        print(f"Using mosquito-band positive check (score > {MOSQUITO_SCORE_THRESHOLD_MIN})\n")
+    elif check_mode == 'mosquito_negative':
+        print(f"Using mosquito-band negative check (score < {MOSQUITO_SCORE_THRESHOLD_MAX})\n")
     else:
         print(f"Using RMS content check only\n")
     
@@ -121,7 +161,12 @@ def sanity_check():
     print("CHECK 1: File counts per class")
     print("="*80)
     
-    class_counts = count_files_per_class(processed_dir)
+    # Special handling for Background (no class subdirectories)
+    if DATASET.lower() == "background":
+        wav_files = list(processed_dir.glob('*.wav'))
+        class_counts = {"Background": len(wav_files)}
+    else:
+        class_counts = count_files_per_class(processed_dir)
     
     if len(class_counts) == 0:
         print("ERROR: No class directories found!")
@@ -158,10 +203,16 @@ def sanity_check():
     print("="*80)
     
     all_issues = []
+    class_stats = {}  # Track stats per class
     
     for class_name, count in sorted(class_counts.items()):
-        class_dir = processed_dir / class_name
-        wav_files = list(class_dir.glob('*.wav'))
+        # Get wav files for this class
+        if DATASET.lower() == "background":
+            class_dir = processed_dir
+            wav_files = list(processed_dir.glob('*.wav'))
+        else:
+            class_dir = processed_dir / class_name
+            wav_files = list(class_dir.glob('*.wav'))
         
         if len(wav_files) == 0:
             print(f"\n{class_name}: No files found!")
@@ -176,11 +227,16 @@ def sanity_check():
         format_issues = 0
         content_issues = 0
         peak_values = []
+        rms_values = []
+        score_values = []
         
         for filepath in sampled_files:
-            format_ok, has_content, sr, num_samples_file, rms, peak = check_file_duration_and_content(filepath, use_mosquito_check)
+            format_ok, has_content, sr, num_samples_file, rms, peak, m_score = check_file_duration_and_content(filepath, check_mode)
             
             peak_values.append(peak)
+            rms_values.append(rms)
+            if m_score is not None:
+                score_values.append(m_score)
             
             if not format_ok:
                 format_issues += 1
@@ -188,11 +244,17 @@ def sanity_check():
             
             if not has_content:
                 content_issues += 1
-                if use_mosquito_check:
-                    m_score = mosquito_score(audio, sr=sr)
+                if m_score is not None:
                     all_issues.append(f"{class_name}/{filepath.name}: low content (rms={rms:.6f}, mscore={m_score:.4f})")
                 else:
                     all_issues.append(f"{class_name}/{filepath.name}: low RMS (rms={rms:.6f})")
+        
+        # Store stats for this class
+        class_stats[class_name] = {
+            'rms': rms_values,
+            'peak': peak_values,
+            'score': score_values
+        }
         
         if format_issues > 0:
             print(f" {format_issues}/{num_samples} files have incorrect format (should be 16kHz, 16000 samples)")
@@ -215,6 +277,29 @@ def sanity_check():
             else:
                 print(f" Peak levels reasonable (avg: {avg_peak:.3f})")
     
+    # Quick stats report
+    print("\n" + "="*80)
+    print(" "*25 + "QUICK STATS PER CLASS")
+    print("="*80)
+    
+    for class_name in sorted(class_stats.keys()):
+        stats = class_stats[class_name]
+        print(f"\n{class_name}:")
+        
+        if stats['rms']:
+            rms_arr = np.array(stats['rms'])
+            print(f"  RMS:   mean={rms_arr.mean():.4f}, median={np.median(rms_arr):.4f}, std={rms_arr.std():.4f}")
+        
+        if stats['peak']:
+            peak_arr = np.array(stats['peak'])
+            clipping_pct = (peak_arr > 0.95).mean() * 100
+            print(f"  Peak:  mean={peak_arr.mean():.3f}, median={np.median(peak_arr):.3f}")
+            print(f"  Clipping: {clipping_pct:.1f}% samples > 0.95")
+        
+        if stats['score']:
+            score_arr = np.array(stats['score'])
+            print(f"  Mosquito score: mean={score_arr.mean():.4f}, median={np.median(score_arr):.4f}, min={score_arr.min():.4f}, max={score_arr.max():.4f}")
+    
     # Check 3: Audio content preview
     print("\n" + "="*80)
     print("CHECK 3: Audio content preview")
@@ -223,8 +308,13 @@ def sanity_check():
     print("(To enable actual playback: pip install sounddevice and uncomment playback code)\n")
     
     for class_name, count in sorted(class_counts.items()):
-        class_dir = processed_dir / class_name
-        wav_files = list(class_dir.glob('*.wav'))
+        # Get wav files for this class
+        if DATASET.lower() == "background":
+            class_dir = processed_dir
+            wav_files = list(processed_dir.glob('*.wav'))
+        else:
+            class_dir = processed_dir / class_name
+            wav_files = list(class_dir.glob('*.wav'))
         
         if len(wav_files) == 0:
             continue
@@ -271,15 +361,22 @@ def sanity_check():
     if len(class_counts) > 0:
         # Estimate recordings based on filename patterns
         for class_name in sorted(class_counts.keys()):
-            class_dir = processed_dir / class_name
-            wav_files = list(class_dir.glob('*.wav'))
+            # Special handling for Background (no class subdirectories)
+            if DATASET.lower() == "background":
+                class_dir = processed_dir
+                wav_files = list(processed_dir.glob('*.wav'))
+            else:
+                class_dir = processed_dir / class_name
+                wav_files = list(class_dir.glob('*.wav'))
             
-            # Extract unique recording names (everything before __winXXXX)
+            # Extract unique recording names (everything before __idx/__seg/__win)
             recordings = set()
             for f in wav_files:
-                parts = f.stem.rsplit('__win', 1)
+                parts = f.stem.rsplit('__idx', 1)
                 if len(parts) == 1:
-                    parts = f.stem.rsplit('__seg', 1)
+                    parts = f.stem.rsplit('__seg', 1)  # backward compatibility
+                if len(parts) == 1:
+                    parts = f.stem.rsplit('__win', 1)  # backward compatibility
                 if len(parts) == 2:
                     recordings.add(parts[0])
             
