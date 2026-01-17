@@ -422,7 +422,7 @@ make setup
 # or: pip install -r requirements.txt
 
 # Create train/val splits
-python scripts/make_splits_wingbeats.py
+python scripts/make_splits_wingsbeats.py
 
 # Train model (run from repo root)
 PYTHONPATH=. python -m src.train.train_main
