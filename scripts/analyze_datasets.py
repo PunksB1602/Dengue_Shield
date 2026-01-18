@@ -1,8 +1,75 @@
 from pathlib import Path
 from collections import defaultdict
 import pandas as pd
+import soundfile as sf
+import numpy as np
 
 AUDIO_EXTS = {".wav", ".flac", ".mp3", ".m4a", ".aac", ".ogg"}
+
+
+def check_file_lengths(files, dataset_name):
+    """Check audio file lengths and return statistics."""
+    if len(files) == 0:
+        return None
+    
+    durations = []
+    sample_rates = []
+    sample_counts = []
+    channels_list = []
+    subtypes = []
+    bit_rates = []
+    
+    total_files = len(files)
+    print(f"Checking {total_files} audio files...", end="", flush=True)
+    
+    for f in files:
+        try:
+            info = sf.info(f)
+            durations.append(info.duration)
+            sample_rates.append(info.samplerate)
+            sample_counts.append(info.frames)
+            channels_list.append(info.channels)
+            subtypes.append(info.subtype)
+            
+            # Calculate bit rate: sample_rate * channels * bits_per_sample
+            bits_per_sample = 16 if 'PCM_16' in info.subtype else 24 if 'PCM_24' in info.subtype else 32
+            bit_rate = info.samplerate * info.channels * bits_per_sample
+            bit_rates.append(bit_rate)
+        except Exception as e:
+            print(f"\nWarning: Could not read {f.name}: {e}")
+            continue
+    
+    print(" Done!")
+    
+    if len(durations) == 0:
+        return None
+    
+    durations = np.array(durations)
+    sample_rates = np.array(sample_rates)
+    sample_counts = np.array(sample_counts)
+    channels_list = np.array(channels_list)
+    bit_rates = np.array(bit_rates)
+    
+    stats = {
+        'total_files': total_files,
+        'files_checked': len(durations),
+        'files_failed': total_files - len(durations),
+        'duration_mean': durations.mean(),
+        'duration_std': durations.std(),
+        'duration_min': durations.min(),
+        'duration_max': durations.max(),
+        'sample_rate_unique': np.unique(sample_rates).tolist(),
+        'channels_unique': np.unique(channels_list).tolist(),
+        'subtype_unique': list(set(subtypes)),
+        'bit_rate_unique': np.unique(bit_rates).tolist(),
+        'sample_count_unique': len(np.unique(sample_counts)),
+        'all_same_length': len(np.unique(sample_counts)) == 1,
+        'all_same_sr': len(np.unique(sample_rates)) == 1,
+        'all_same_channels': len(np.unique(channels_list)) == 1,
+        'all_same_bitrate': len(np.unique(bit_rates)) == 1
+    }
+    
+    return stats
 
 
 def count_recordings_recursive(species_dir, max_depth=2):
@@ -117,6 +184,27 @@ def analyze_abuzz(base_path):
         print(f"  - Files:                  {total_files/len(species_dirs):.1f}")
         print(f"  - Size:                   {(total_size/len(species_dirs)):.2f} MB")
     
+    # Check file lengths
+    all_files = []
+    for species_dir in species_dirs:
+        all_files.extend([f for f in species_dir.iterdir()
+                         if f.is_file() and f.suffix.lower() in AUDIO_EXTS])
+    
+    length_stats = check_file_lengths(all_files, "Abuzz")
+    if length_stats:
+        print(f"\nFile Analysis - Checked {length_stats['files_checked']}/{length_stats['total_files']} files (Failed: {length_stats['files_failed']}):")
+        print(f"  - Duration (mean):        {length_stats['duration_mean']:.3f} seconds")
+        print(f"  - Duration (std):         {length_stats['duration_std']:.4f} seconds")
+        print(f"  - Duration (min-max):     {length_stats['duration_min']:.3f} - {length_stats['duration_max']:.3f} seconds")
+        print(f"  - Sample rates:           {', '.join(map(str, length_stats['sample_rate_unique']))} Hz")
+        print(f"  - Channels:               {', '.join(map(str, length_stats['channels_unique']))}")
+        print(f"  - Bit rates:              {', '.join(map(lambda x: f'{x//1000} kbps', length_stats['bit_rate_unique']))}")
+        print(f"  - Sample formats:         {', '.join(length_stats['subtype_unique'])}")
+        print(f"  - All same length:        {'YES' if length_stats['all_same_length'] else 'NO'}")
+        print(f"  - All same sample rate:   {'YES' if length_stats['all_same_sr'] else 'NO'}")
+        print(f"  - All same channels:      {'YES' if length_stats['all_same_channels'] else 'NO'}")
+        print(f"  - All same bit rate:      {'YES' if length_stats['all_same_bitrate'] else 'NO'}")
+    
     print("="*90)
     
     return df
@@ -141,6 +229,7 @@ def analyze_wingsbeats(base_path):
     total_recordings = 0
     total_files = 0
     total_size = 0
+    all_files = []  # Collect files for later analysis
     
     for species_dir in species_dirs:
         species_name = species_dir.name
@@ -158,6 +247,7 @@ def analyze_wingsbeats(base_path):
                      if f.is_file() and f.suffix.lower() in AUDIO_EXTS]
             
             file_count += len(files)
+            all_files.extend(files)  # Store for later
             
             for f in files:
                 ext = f.suffix.lower() if f.suffix else '(no ext)'
@@ -205,6 +295,22 @@ def analyze_wingsbeats(base_path):
         print(f"  - Recordings:             {total_recordings/len(species_dirs):.1f}")
         print(f"  - Files:                  {total_files/len(species_dirs):.1f}")
         print(f"  - Size:                   {(total_size/len(species_dirs)):.2f} MB")
+    
+    # Use already collected files for length check
+    length_stats = check_file_lengths(all_files, "Wingsbeats")
+    if length_stats:
+        print(f"\nFile Analysis - Checked {length_stats['files_checked']}/{length_stats['total_files']} files (Failed: {length_stats['files_failed']}):")
+        print(f"  - Duration (mean):        {length_stats['duration_mean']:.3f} seconds")
+        print(f"  - Duration (std):         {length_stats['duration_std']:.4f} seconds")
+        print(f"  - Duration (min-max):     {length_stats['duration_min']:.3f} - {length_stats['duration_max']:.3f} seconds")
+        print(f"  - Sample rates:           {', '.join(map(str, length_stats['sample_rate_unique']))} Hz")
+        print(f"  - Channels:               {', '.join(map(str, length_stats['channels_unique']))}")
+        print(f"  - Bit rates:              {', '.join(map(lambda x: f'{x//1000} kbps', length_stats['bit_rate_unique']))}")
+        print(f"  - Sample formats:         {', '.join(length_stats['subtype_unique'])}")
+        print(f"  - All same length:        {'YES' if length_stats['all_same_length'] else 'NO'}")
+        print(f"  - All same sample rate:   {'YES' if length_stats['all_same_sr'] else 'NO'}")
+        print(f"  - All same channels:      {'YES' if length_stats['all_same_channels'] else 'NO'}")
+        print(f"  - All same bit rate:      {'YES' if length_stats['all_same_bitrate'] else 'NO'}")
     
     print("="*90)
     
@@ -314,6 +420,31 @@ def analyze_background(base_path):
             print(f"\nAverage per Category:")
             print(f"  - Files:                  {total_files/len(results):.1f}")
             print(f"  - Size:                   {(total_size/len(results)):.2f} MB")
+        
+        # Check file lengths
+        all_files = []
+        if len(subdirs) > 0:
+            for subdir in subdirs:
+                all_files.extend([f for f in subdir.rglob("*")
+                                if f.is_file() and f.suffix.lower() in AUDIO_EXTS])
+        else:
+            all_files.extend([f for f in base_path.rglob("*")
+                            if f.is_file() and f.suffix.lower() in AUDIO_EXTS])
+        
+        length_stats = check_file_lengths(all_files, "Background")
+        if length_stats:
+            print(f"\nFile Analysis - Checked {length_stats['files_checked']}/{length_stats['total_files']} files (Failed: {length_stats['files_failed']}):")
+            print(f"  - Duration (mean):        {length_stats['duration_mean']:.3f} seconds")
+            print(f"  - Duration (std):         {length_stats['duration_std']:.4f} seconds")
+            print(f"  - Duration (min-max):     {length_stats['duration_min']:.3f} - {length_stats['duration_max']:.3f} seconds")
+            print(f"  - Sample rates:           {', '.join(map(str, length_stats['sample_rate_unique']))} Hz")
+            print(f"  - Channels:               {', '.join(map(str, length_stats['channels_unique']))}")
+            print(f"  - Bit rates:              {', '.join(map(lambda x: f'{x//1000} kbps', length_stats['bit_rate_unique']))}")
+            print(f"  - Sample formats:         {', '.join(length_stats['subtype_unique'])}")
+            print(f"  - All same length:        {'YES' if length_stats['all_same_length'] else 'NO'}")
+            print(f"  - All same sample rate:   {'YES' if length_stats['all_same_sr'] else 'NO'}")
+            print(f"  - All same channels:      {'YES' if length_stats['all_same_channels'] else 'NO'}")
+            print(f"  - All same bit rate:      {'YES' if length_stats['all_same_bitrate'] else 'NO'}")
         
         print("="*90)
         
@@ -436,6 +567,4 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
 

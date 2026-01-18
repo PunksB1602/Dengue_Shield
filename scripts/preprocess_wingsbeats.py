@@ -1,6 +1,5 @@
 """
-Preprocess Wingsbeats dataset: merge micro-clips into 1-second standardized windows.
-
+Preprocess Wingsbeats dataset: standardize each micro-clip to 1-second windows for ML training.
 Usage:
     python scripts/preprocess_wingsbeats.py
 """
@@ -13,6 +12,11 @@ import hashlib
 import numpy as np
 import soundfile as sf
 from tqdm import tqdm
+
+try:
+    import librosa
+except ImportError:
+    librosa = None
 
 warnings.filterwarnings('ignore')
 
@@ -30,45 +34,20 @@ CLASS_MAPPING = {
     'Culex quinquefasciatus': 'Culex',
 }
 
-PEAK_THRESHOLD = 0.005
-CLIP_RMS_THRESHOLD = 0.001
+CLIP_RMS_THRESHOLD = 0.0002
 MIN_CLIP_SAMPLES = 200
-FADE_MS = 3
-FADE_SAMPLES = int(TARGET_SR * FADE_MS / 1000)
-GAP_MS = 0
-MIN_TAIL_SEC = 0.3
 MAX_WINDOWS_PER_RECORDING = 200
-NORMALIZE_CLIPS = False
-SILENCE_RATIO_THRESHOLD = 0.95
-
-
-def normalize_clip(audio, headroom=0.95):
-    """Peak normalize audio clip to prevent clipping."""
-    peak = np.abs(audio).max()
-    if peak > 1e-6:
-        return audio * (headroom / peak)
-    return audio
-
-
-def apply_fade(audio, fade_samples=FADE_SAMPLES):
-    """Apply fade-in/out to prevent click artifacts when concatenating."""
-    if len(audio) <= 2 * fade_samples:
-        return audio
-    w = np.ones(len(audio), dtype=np.float32)
-    ramp = np.linspace(0.0, 1.0, fade_samples, dtype=np.float32)
-    w[:fade_samples] = ramp
-    w[-fade_samples:] = ramp[::-1]
-    return audio * w
 
 
 def load_audio_smart(filepath, target_sr=TARGET_SR):
-    """Load audio, convert to mono and resample if needed."""
+    """Robust audio loader: mono conversion and resampling if needed."""
     try:
         audio, sr = sf.read(filepath, dtype='float32')
         if audio.ndim == 2:
             audio = audio.mean(axis=1)
         if sr != target_sr:
-            import librosa
+            if librosa is None:
+                raise RuntimeError("librosa required for resampling but not installed")
             audio = librosa.resample(audio, orig_sr=sr, target_sr=target_sr)
             sr = target_sr
         return audio, sr
@@ -77,162 +56,150 @@ def load_audio_smart(filepath, target_sr=TARGET_SR):
 
 
 def get_recording_folders(species_dir):
-    """Return all D_* recording folders in a species directory."""
+    """Find leaf D_* folders with WAVs (no nested D_*)."""
     recording_folders = []
     for item in species_dir.rglob('*'):
         if item.is_dir() and item.name.startswith('D_') and len(item.name.split('_')) >= 7:
-            recording_folders.append(item)
+            has_wavs = any(item.rglob('*.wav'))
+            has_nested_d = any(
+                sub.is_dir() and sub.name.startswith('D_') and len(sub.name.split('_')) >= 7
+                for sub in item.rglob('*')
+            )
+            if has_wavs and not has_nested_d:
+                recording_folders.append(item)
     return sorted(recording_folders)
 
 
 def collect_wav_files(recording_folder):
-    """Collect all .wav files in recording folder."""
+    """List all .wav files in a folder."""
     return sorted([f for f in recording_folder.rglob('*.wav') if f.is_file()])
 
 
+def standardize_to_1s(audio, target_samples=TARGET_SAMPLES, rng=None):
+    """Crop or tile audio to exactly target_samples."""
+    n = len(audio)
+    if n == 0:
+        return None
+
+    if n >= target_samples:
+        # Crop (center or random crop)
+        if rng is not None:
+            start = rng.randint(0, n - target_samples + 1)
+        else:
+            start = (n - target_samples) // 2
+        return audio[start:start + target_samples].astype(np.float32)
+
+    # Tile/loop short clips to avoid zero-padding artifacts
+    num_repeats = (target_samples // n) + 1
+    tiled = np.tile(audio, num_repeats)[:target_samples]
+    
+    # Apply random circular shift for augmentation (short clips only)
+    if rng is not None:
+        shift = rng.randint(0, target_samples)
+        tiled = np.roll(tiled, shift)
+    
+    return tiled.astype(np.float32)
+
+
 def process_recording_folder(recording_folder, species_name, class_name, output_dir, input_base, stats):
-    """Merge micro-clips from a recording folder into 1s windows."""
+    """
+    For each micro-clip: resample, pad/crop to 1s, filter, and save as a single window.
+    No merging across clips.
+    """
     recording_name = recording_folder.name
     wav_files = collect_wav_files(recording_folder)
     if len(wav_files) == 0:
         return 0, 0, 0, 0, False
-    # Shuffle micro-clips with stable MD5-based seed for reproducibility
+
     seed_key = str(recording_folder.relative_to(input_base)).replace('\\', '/')
     folder_seed = int(hashlib.md5(seed_key.encode('utf-8')).hexdigest()[:8], 16)
-    rng = np.random.RandomState(folder_seed)
-    wav_files = [wav_files[i] for i in rng.permutation(len(wav_files))]
-    clip_list = []
-    remainder = np.array([], dtype=np.float32)
-    gap_samples = int((GAP_MS / 1000.0) * TARGET_SR)
-    silence_gap = np.zeros(gap_samples, dtype=np.float32) if gap_samples > 0 else None
+
     window_count = 0
     clips_processed_local = 0
     clips_skipped_local = 0
     total_clips_seen = 0
-    error_count = 0
-    for wav_file in wav_files:
+
+    for i, wav_file in enumerate(wav_files):
         if window_count >= MAX_WINDOWS_PER_RECORDING:
             break
+
         total_clips_seen += 1
         try:
             audio, sr = load_audio_smart(wav_file, target_sr=TARGET_SR)
-            if len(audio) == 0:
+            audio = audio.astype(np.float32, copy=False)
+            
+            # Remove DC offset (some devices have tiny bias)
+            audio = audio - np.mean(audio)
+
+            if audio is None or len(audio) < MIN_CLIP_SAMPLES:
                 clips_skipped_local += 1
                 continue
-            if len(audio) < MIN_CLIP_SAMPLES:
-                clips_skipped_local += 1
-                continue
-            clip_rms = np.sqrt(np.mean(audio ** 2))
+
+            # Minimal quality check: skip low-RMS clips
+            clip_rms = float(np.sqrt(np.mean(audio ** 2)))
             if clip_rms < CLIP_RMS_THRESHOLD:
                 clips_skipped_local += 1
                 continue
-            if np.max(np.abs(audio)) < PEAK_THRESHOLD:
+
+            # Standardize to 1s window (tile or crop, with augmentation)
+            window = standardize_to_1s(
+                audio,
+                target_samples=TARGET_SAMPLES,
+                rng=np.random.RandomState(folder_seed + i)
+            )
+            if window is None:
                 clips_skipped_local += 1
                 continue
-            if NORMALIZE_CLIPS:
-                audio = normalize_clip(audio)
-            audio = apply_fade(audio)
-            if silence_gap is not None and clips_processed_local > 0:
-                clip_list.append(silence_gap)
-            clip_list.append(audio)
+
+            # Peak normalization for stable training (headroom 0.95)
+            peak = np.abs(window).max()
+            if peak > 1e-4:
+                window = window * (0.95 / peak)
+
+            # Compute final RMS for manifest
+            win_rms = float(np.sqrt(np.mean(window ** 2)))
+
+            # Save window
+            output_filename = f"{species_name.replace(' ', '_')}__{recording_name}__clip{window_count:05d}.wav"
+            output_path = output_dir / output_filename
+            sf.write(output_path, window, TARGET_SR, subtype='PCM_16')
+
+            rel_path = output_path.relative_to(Path('data/processed'))
+            recording_id = f"{species_name}__{recording_name}"
+            window_id = f"{recording_id}__clip{window_count:05d}"
+
+            stats['manifest'].append({
+                'path': str(rel_path).replace('\\', '/'),
+                'label': class_name,
+                'source': 'Wingsbeats',
+                'species': species_name,
+                'recording': recording_name,
+                'recording_id': recording_id,
+                'window_id': window_id,
+                'origin': seed_key,
+                'rms': f"{win_rms:.6f}"
+            })
+
+            window_count += 1
             clips_processed_local += 1
-            # Batch every 50 clips to avoid O(n²) concat
-            if len(clip_list) >= 50:
-                if len(remainder) > 0:
-                    buffer = np.concatenate([remainder] + clip_list)
-                else:
-                    buffer = np.concatenate(clip_list)
-                clip_list = []
-                while len(buffer) >= TARGET_SAMPLES and window_count < MAX_WINDOWS_PER_RECORDING:
-                    window = buffer[:TARGET_SAMPLES]
-                    buffer = buffer[TARGET_SAMPLES:]
-                    win_rms = np.sqrt(np.mean(window**2))
-                    if win_rms < 0.001:
-                        continue
-                    silence_ratio = (np.abs(window) < 1e-4).mean()
-                    if silence_ratio > SILENCE_RATIO_THRESHOLD:
-                        continue
-                    output_filename = f"{species_name.replace(' ', '_')}__{recording_name}__win{window_count:04d}.wav"
-                    output_path = output_dir / output_filename
-                    sf.write(output_path, window, TARGET_SR, subtype='PCM_16')
-                    rel_path = output_path.relative_to(Path('data/processed'))
-                    stats['manifest'].append({
-                        'path': str(rel_path).replace('\\', '/'),
-                        'label': class_name,
-                        'source': 'Wingsbeats',
-                        'species': species_name,
-                        'recording': recording_name,
-                        'origin': seed_key,
-                        'rms': f"{win_rms:.6f}"
-                    })
-                    window_count += 1
-                remainder = buffer
+
         except Exception as e:
-            error_count += 1
             stats['errors'].append(f"{wav_file.name}: {str(e)}")
+            clips_skipped_local += 1
             continue
-    # Final batch
-    if len(clip_list) > 0:
-        buffer = np.concatenate([remainder] + clip_list) if len(remainder) > 0 else np.concatenate(clip_list)
-    else:
-        buffer = remainder
-    while len(buffer) >= TARGET_SAMPLES and window_count < MAX_WINDOWS_PER_RECORDING:
-        window = buffer[:TARGET_SAMPLES]
-        buffer = buffer[TARGET_SAMPLES:]
-        win_rms = np.sqrt(np.mean(window**2))
-        if win_rms < 0.001:
-            continue
-        silence_ratio = (np.abs(window) < 1e-4).mean()
-        if silence_ratio > SILENCE_RATIO_THRESHOLD:
-            continue
-        output_filename = f"{species_name.replace(' ', '_')}__{recording_name}__win{window_count:04d}.wav"
-        output_path = output_dir / output_filename
-        sf.write(output_path, window, TARGET_SR, subtype='PCM_16')
-        rel_path = output_path.relative_to(Path('data/processed'))
-        stats['manifest'].append({
-            'path': str(rel_path).replace('\\', '/'),
-            'label': class_name,
-            'source': 'Wingsbeats',
-            'species': species_name,
-            'recording': recording_name,
-            'origin': seed_key,
-            'rms': f"{win_rms:.6f}"
-        })
-        window_count += 1
-    # Pad and save tail if long enough
-    if len(buffer) >= int(MIN_TAIL_SEC * TARGET_SR) and window_count < MAX_WINDOWS_PER_RECORDING:
-        padding_needed = TARGET_SAMPLES - len(buffer)
-        buffer = np.concatenate([buffer, np.zeros(padding_needed, dtype=np.float32)]) if padding_needed > 0 else buffer[:TARGET_SAMPLES]
-        win_rms = np.sqrt(np.mean(buffer**2))
-        if win_rms >= 0.001:
-            silence_ratio = (np.abs(buffer) < 1e-4).mean()
-            if silence_ratio <= SILENCE_RATIO_THRESHOLD:
-                output_filename = f"{species_name.replace(' ', '_')}__{recording_name}__win{window_count:04d}.wav"
-                output_path = output_dir / output_filename
-                sf.write(output_path, buffer, TARGET_SR, subtype='PCM_16')
-                rel_path = output_path.relative_to(Path('data/processed'))
-                stats['manifest'].append({
-                    'path': str(rel_path).replace('\\', '/'),
-                    'label': class_name,
-                    'source': 'Wingsbeats',
-                    'species': species_name,
-                    'recording': recording_name,
-                    'origin': seed_key,
-                    'rms': f"{win_rms:.6f}"
-                })
-                window_count += 1
+
     recording_used = window_count > 0
     return window_count, clips_processed_local, clips_skipped_local, total_clips_seen, recording_used
 
 
 def preprocess_wingsbeats():
-    """Main preprocessing for Wingsbeats dataset."""
+    """Main entry point for Wingsbeats preprocessing."""
     input_base = Path('data/raw/Wingsbeats')
     output_base = Path('data/processed/Wingsbeats')
     if not input_base.exists():
         print(f"ERROR: Input directory not found: {input_base}")
         return
-    # Clear existing output files to avoid duplicates on reruns
+    # Remove existing output to avoid duplicates on reruns
     if output_base.exists():
         for wav_file in output_base.rglob('*.wav'):
             wav_file.unlink()
@@ -244,14 +211,11 @@ def preprocess_wingsbeats():
     print(f"\nConfiguration:")
     print(f"  Target sample rate:     {TARGET_SR} Hz")
     print(f"  Target duration:        {TARGET_DURATION} s ({TARGET_SAMPLES} samples)")
-    print(f"  Peak threshold:         {PEAK_THRESHOLD} (skip clips below this)")
     print(f"  Clip RMS threshold:     {CLIP_RMS_THRESHOLD} (skip clips below this)")
     print(f"  Min clip length:        {MIN_CLIP_SAMPLES} samples (~{MIN_CLIP_SAMPLES/TARGET_SR*1000:.1f} ms)")
-    print(f"  Fade duration:          {FADE_MS} ms (prevents clicks)")
-    print(f"  Normalize clips:        {NORMALIZE_CLIPS}")
-    print(f"  Silence ratio filter:   {SILENCE_RATIO_THRESHOLD} (drop mostly-silent windows)")
-    print(f"  Gap between clips:      {GAP_MS} ms")
-    print(f"  Min tail length:        {MIN_TAIL_SEC} s")
+    print(f"  Short-clip handling:    Loop/tile (no zero-padding)")
+    print(f"  Augmentation:           Random circular shift (short clips) + random crop (long clips)")
+    print(f"  Normalization:          Peak normalize to 0.95 headroom")
     print(f"  Max windows/recording:  {MAX_WINDOWS_PER_RECORDING}")
     print("="*80 + "\n")
     stats = {
@@ -318,5 +282,40 @@ def preprocess_wingsbeats():
     print("\nWindows created by class:")
     for class_name in sorted(stats['windows_created'].keys()):
         count = stats['windows_created'][class_name]
-        pct = (count / total_windows * 100) if total_windows > 0
-        
+        pct = (count / total_windows * 100) if total_windows > 0 else 0
+        print(f"  {class_name:15s} {count:6d} windows ({pct:5.1f}%)")
+    print(f"\nTotal:")
+    print(f"  Windows created:        {total_windows}")
+    print(f"  Recordings processed:   {total_recordings}")
+    print(f"  Micro-clips processed:  {stats['clips_processed']}")
+    print(f"  Micro-clips skipped:    {stats['clips_skipped']} (short or low RMS)")
+    if len(stats['errors']) > 0:
+        print(f"\nErrors encountered:     {len(stats['errors'])}")
+        if len(stats['errors']) <= 10:
+            for error in stats['errors']:
+                print(f"  - {error}")
+        else:
+            for error in stats['errors'][:5]:
+                print(f"  - {error}")
+            print(f"  ... and {len(stats['errors']) - 5} more errors")
+    print("="*80)
+    print("\nPreprocessing complete!")
+    print(f"Output saved to: {output_base.absolute()}")
+    manifest_path = Path('data/splits/wingsbeats_manifest.csv')
+    manifest_path.parent.mkdir(parents=True, exist_ok=True)
+    if stats['manifest']:
+        with open(manifest_path, 'w', newline='', encoding='utf-8') as f:
+            fieldnames = ['path', 'label', 'source', 'species', 'recording', 'recording_id', 'window_id', 'origin', 'rms']
+            writer = csv.DictWriter(f, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(stats['manifest'])
+        print(f"Manifest saved to: {manifest_path.absolute()}")
+    print()
+
+
+def main():
+    preprocess_wingsbeats()
+
+if __name__ == "__main__":
+    main()
+

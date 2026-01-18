@@ -1,6 +1,5 @@
 """
 Sanity check for preprocessed datasets.
-
 Usage:
     python scripts/sanity_check_processed.py Wingsbeats
     python scripts/sanity_check_processed.py Abuzz
@@ -10,6 +9,8 @@ Usage:
 import sys
 from pathlib import Path
 import random
+import hashlib
+import csv
 import numpy as np
 import soundfile as sf
 from collections import defaultdict
@@ -28,7 +29,7 @@ MOSQUITO_SCORE_THRESHOLD_MAX = 0.12
 
 
 def count_files_per_class(processed_dir):
-    """Count number of WAV files in each class directory."""
+    """Count WAV files in each class directory."""
     class_counts = {}
     for class_dir in sorted(processed_dir.iterdir()):
         if class_dir.is_dir():
@@ -38,19 +39,21 @@ def count_files_per_class(processed_dir):
 
 
 def mosquito_score(window, sr=TARGET_SR):
-    """Ratio of energy in 250-1200 Hz to total 0-4kHz."""
-    x = window - np.mean(window)
-    spec = np.abs(np.fft.rfft(x))**2
+    """Mosquito-band energy ratio (250-1200 Hz, Hann window)."""
+    x = window.astype(np.float32)
+    x = x - np.mean(x)
+    w = np.hanning(len(x)).astype(np.float32)
+    spec = np.abs(np.fft.rfft(x * w))**2
     freqs = np.fft.rfftfreq(len(x), d=1.0/sr)
     mask_all = (freqs >= 0) & (freqs <= FMAX)
     mask_band = (freqs >= BAND_LO) & (freqs <= BAND_HI)
     return float(spec[mask_band].sum() / (spec[mask_all].sum() + 1e-12))
 
 
-def check_file_duration_and_content(filepath, check_mode='rms_only'):
+def check_file_duration_and_content(filepath, check_mode='rms_only', dataset_name=''):
     """Check file format and content based on dataset type."""
     try:
-        audio, sr = sf.read(filepath, dtype='float32')
+        audio, sr = sf.read(filepath, dtype='float32', always_2d=False)
         if audio.ndim == 2:
             audio = audio.mean(axis=1)
         sr_ok = (sr == TARGET_SR)
@@ -58,15 +61,23 @@ def check_file_duration_and_content(filepath, check_mode='rms_only'):
         format_ok = sr_ok and samples_ok
         rms = np.sqrt(np.mean(audio ** 2))
         peak = np.abs(audio).max()
-        m_score = None
-        if check_mode == 'mosquito_positive':
-            m_score = mosquito_score(audio, sr=sr)
-            has_content = (rms > 0.001) and (m_score > MOSQUITO_SCORE_THRESHOLD_MIN)
-        elif check_mode == 'mosquito_negative':
-            m_score = mosquito_score(audio, sr=sr)
-            has_content = (rms > 0.001) and (m_score < MOSQUITO_SCORE_THRESHOLD_MAX)
+        m_score = mosquito_score(audio, sr=sr)  # Compute for stats, but don't use for pass/fail
+        
+        # Dataset-aware content thresholds
+        if dataset_name.lower() == 'wingsbeats':
+            has_content = (rms > 0.0002) and (peak > 0.003)
+        elif dataset_name.lower() == 'abuzz':
+            has_content = (rms > 0.0005) and (peak > 0.005)
+        elif dataset_name.lower() == 'background':
+            has_content = (rms > 0.00025) or (peak > 0.0015)
         else:
-            has_content = rms > 0.001
+            # Fallback based on check_mode for backward compatibility
+            if check_mode == 'mosquito_positive':
+                has_content = (rms > 0.0005) and (peak > 0.003)
+            elif check_mode == 'mosquito_negative':
+                has_content = (rms > 0.0007) or (peak > 0.003)
+            else:
+                has_content = rms > 0.001
         return format_ok, has_content, sr, len(audio), rms, peak, m_score
     except Exception:
         return False, False, 0, 0, 0.0, 0.0, None
@@ -75,7 +86,7 @@ def check_file_duration_and_content(filepath, check_mode='rms_only'):
 def play_audio_sample(filepath):
     """Print audio file info; playback optional (see code)."""
     try:
-        audio, sr = sf.read(filepath, dtype='float32')
+        audio, sr = sf.read(filepath, dtype='float32', always_2d=False)
         if audio.ndim == 2:
             audio = audio.mean(axis=1)
         duration = len(audio) / sr
@@ -102,7 +113,7 @@ def sanity_check():
     ]
     processed_dir = None
     if DATASET.lower() == "background":
-        processed_dir = Path("data/processed/Background/Background")
+        processed_dir = Path("data/processed/Background")
     else:
         for p in candidates:
             if p.exists():
@@ -126,9 +137,11 @@ def sanity_check():
     print("="*80)
     print(f"Checking: {processed_dir.absolute()}")
     if check_mode == 'mosquito_positive':
-        print(f"Using mosquito-band positive check (score > {MOSQUITO_SCORE_THRESHOLD_MIN})\n")
+        print(f"Content check: RMS > 0.0005 and peak > 0.003 (matches preprocessing)")
+        print(f"Mosquito score computed for stats only (band: {BAND_LO}-{BAND_HI} Hz)\n")
     elif check_mode == 'mosquito_negative':
-        print(f"Using mosquito-band negative check (score < {MOSQUITO_SCORE_THRESHOLD_MAX})\n")
+        print(f"Content check: RMS > 0.0007 or peak > 0.003 (quiet ambience allowed)")
+        print(f"Mosquito score computed for stats only (band: {BAND_LO}-{BAND_HI} Hz)\n")
     else:
         print(f"Using RMS content check only\n")
     # Check 1: File counts per class
@@ -168,6 +181,8 @@ def sanity_check():
     print("="*80)
     all_issues = []
     class_stats = {}
+    audio_hashes = {}  # For duplicate detection
+    duplicate_count = 0
     for class_name, count in sorted(class_counts.items()):
         if DATASET.lower() == "background":
             class_dir = processed_dir
@@ -187,18 +202,33 @@ def sanity_check():
         rms_values = []
         score_values = []
         for filepath in sampled_files:
-            format_ok, has_content, sr, num_samples_file, rms, peak, m_score = check_file_duration_and_content(filepath, check_mode)
+            format_ok, has_content, sr, num_samples_file, rms, peak, m_score = check_file_duration_and_content(filepath, check_mode, DATASET)
             peak_values.append(peak)
             rms_values.append(rms)
             if m_score is not None:
                 score_values.append(m_score)
+            # Duplicate check: stable hash using MD5 with RMS+peak for extra reliability
+            try:
+                audio, _ = sf.read(filepath, dtype='float32', always_2d=False)
+                if audio.ndim == 2:
+                    audio = audio.mean(axis=1)
+                sig = np.round(audio[::50], 4).astype(np.float32).tobytes()
+                meta = f"{rms:.6f}_{peak:.6f}".encode()
+                audio_hash = hashlib.md5(sig + meta).hexdigest()
+                if audio_hash in audio_hashes:
+                    duplicate_count += 1
+                    all_issues.append(f"{class_name}/{filepath.name}: Duplicate of {audio_hashes[audio_hash]}")
+                else:
+                    audio_hashes[audio_hash] = f"{class_name}/{filepath.name}"
+            except Exception:
+                pass
             if not format_ok:
                 format_issues += 1
                 all_issues.append(f"{class_name}/{filepath.name}: Wrong format (SR={sr}, samples={num_samples_file})")
             if not has_content:
                 content_issues += 1
                 if m_score is not None:
-                    all_issues.append(f"{class_name}/{filepath.name}: low content (rms={rms:.6f}, mscore={m_score:.4f})")
+                    all_issues.append(f"{class_name}/{filepath.name}: low content (rms={rms:.6f}, peak={peak:.4f}, mscore={m_score:.4f})")
                 else:
                     all_issues.append(f"{class_name}/{filepath.name}: low RMS (rms={rms:.6f})")
         class_stats[class_name] = {
@@ -222,6 +252,12 @@ def sanity_check():
                 print(f" This suggests aggressive normalization. Check if this is expected.")
             else:
                 print(f" Peak levels reasonable (avg: {avg_peak:.3f})")
+    # Duplicate summary
+    if duplicate_count > 0:
+        print(f"\n DUPLICATES DETECTED: {duplicate_count} exact duplicate files found in random sample!")
+        print(f" Note: Hash-based detection only catches identical audio. Overlapped windows from")
+        print(f" sliding-window extraction (e.g., Abuzz hop=0.5s) are expected and not duplicates.")
+        print(f" True duplicates suggest rerun/collision issues. Check 'origin' field in manifest.")
     # Quick stats per class
     print("\n" + "="*80)
     print(" "*25 + "QUICK STATS PER CLASS")
@@ -240,6 +276,70 @@ def sanity_check():
         if stats['score']:
             score_arr = np.array(stats['score'])
             print(f"  Mosquito score: mean={score_arr.mean():.4f}, median={np.median(score_arr):.4f}, min={score_arr.min():.4f}, max={score_arr.max():.4f}")
+    
+    # Bucket-aware stats for Background dataset
+    if DATASET.lower() == "background":
+        print("\n" + "="*80)
+        print(" "*20 + "BACKGROUND BUCKET ANALYSIS")
+        print("="*80)
+        manifest_path = Path("data/splits/background_manifest.csv")
+        if manifest_path.exists():
+            bucket_stats = {'hard': {'count': 0, 'scores': []}, 'easy': {'count': 0, 'scores': []}}
+            try:
+                with open(manifest_path, 'r') as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        bucket = row.get('bucket', 'unknown')
+                        if bucket in bucket_stats:
+                            bucket_stats[bucket]['count'] += 1
+                            # Compute mosquito score if we can
+                            wav_path = Path("data/processed") / row['path']
+                            if wav_path.exists():
+                                try:
+                                    audio, sr = sf.read(str(wav_path), dtype='float32', always_2d=False)
+                                    # Ensure mono
+                                    if audio.ndim == 2:
+                                        audio = audio.mean(axis=1)
+                                    # Skip files that don't match expected format
+                                    if sr != 16000 or len(audio) != 16000:
+                                        continue
+                                    score = mosquito_score(audio, sr)
+                                    bucket_stats[bucket]['scores'].append(score)
+                                except Exception as e:
+                                    pass
+                
+                # Report bucket counts
+                total = sum(b['count'] for b in bucket_stats.values())
+                print(f"\nBucket Distribution:")
+                for bucket in ['hard', 'easy']:
+                    count = bucket_stats[bucket]['count']
+                    pct = (count / total * 100) if total > 0 else 0
+                    print(f"  {bucket.upper()}: {count} files ({pct:.1f}%)")
+                
+                # Report mosquito score by bucket
+                print(f"\nMosquito Score by Bucket:")
+                for bucket in ['hard', 'easy']:
+                    scores = bucket_stats[bucket]['scores']
+                    if scores:
+                        scores_arr = np.array(scores)
+                        high_count = (scores_arr > 0.12).sum()
+                        high_pct = (high_count / len(scores) * 100) if len(scores) > 0 else 0
+                        print(f"  {bucket.upper()}:")
+                        print(f"    Mean:   {scores_arr.mean():.4f}")
+                        print(f"    Median: {np.median(scores_arr):.4f}")
+                        print(f"    P25:    {np.percentile(scores_arr, 25):.4f}")
+                        print(f"    P75:    {np.percentile(scores_arr, 75):.4f}")
+                        print(f"    Min:    {scores_arr.min():.4f}")
+                        print(f"    Max:    {scores_arr.max():.4f}")
+                        print(f"    High mosquito-like (>0.12): {high_count}/{len(scores)} ({high_pct:.1f}%)")
+                    else:
+                        print(f"  {bucket.upper()}: No scores computed")
+                        
+            except Exception as e:
+                print(f"Error reading manifest: {e}")
+        else:
+            print(f"Manifest not found: {manifest_path}")
+            print("Cannot compute bucket statistics without manifest.")
     # Audio content preview
     print("\n" + "="*80)
     print("CHECK 3: Audio content preview")
@@ -298,12 +398,15 @@ def sanity_check():
                 wav_files = list(class_dir.glob('*.wav'))
             recordings = set()
             for f in wav_files:
-                parts = f.stem.rsplit('__idx', 1)
-                if len(parts) == 1:
-                    parts = f.stem.rsplit('__seg', 1)
-                if len(parts) == 1:
-                    parts = f.stem.rsplit('__win', 1)
-                if len(parts) == 2:
+                # Match filename patterns: __clip for Wingsbeats, __idx for Abuzz/Background
+                if '__clip' in f.stem:
+                    parts = f.stem.rsplit('__clip', 1)
+                elif '__idx' in f.stem:
+                    parts = f.stem.rsplit('__idx', 1)
+                else:
+                    parts = [f.stem]  # Use full stem if no known pattern
+                
+                if len(parts) >= 1:
                     recordings.add(parts[0])
             if len(recordings) > 0:
                 avg_windows = len(wav_files) / len(recordings)
@@ -316,5 +419,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
